@@ -1,137 +1,239 @@
+// Spawner.cs – Mechanica?Sandbox?2D
+// 2025?05?06
+//  • Spawning, joint creation, background deselect
+//  • Newly spawned part becomes selected
+//  • Uses modern FindObjectsByType to avoid deprecation warnings
+
 using UnityEngine;
+using UnityEngine.UI;
 using System.Collections.Generic;
 
 public enum JointType { Bolt, Hinge }
 
 public class Spawner : MonoBehaviour
 {
-    [SerializeField] private Color spawnColor = Color.white;
-    [SerializeField] private Sprite squareSprite = null;
+    // ????????????????????????????????????????????????
+    // SPAWN SETTINGS
+    // ????????????????????????????????????????????????
 
+    [Header("Square Settings")]
+    [SerializeField] private Color spawnSquareColor = Color.white;
+    [SerializeField] private Sprite squareSprite = null;
+    [SerializeField] private int squareSortingOrder = 0;
+
+    [Header("Circle Settings")]
+    [SerializeField] private Color spawnCircleColor = Color.white;
+    [SerializeField] private Sprite circleSprite = null;
+    [SerializeField] private int circleSortingOrder = 0;
+
+    // ????????????????????????????????????????????????
+    // JOINT SETTINGS
+    // ????????????????????????????????????????????????
+
+    [Header("Bolt Settings")]
     [SerializeField] private Color boltColor = Color.yellow;
     [SerializeField] private Sprite boltSprite = null;
-
-    [SerializeField] private Color hingeColor = Color.green;       // Hinge color
-    [SerializeField] private Sprite hingeSprite = null;            // Hinge sprite
-    [SerializeField] private float hingeSize = 0.15f;                // Hinge size
-    [SerializeField] private int hingeSortingOrder = 2;              // Hinge sorting order
-
-    [SerializeField] private float boltSize = 0.2f;
-
-    [SerializeField] private int squareSortingOrder = 0;
+    [SerializeField] private float boltSize = 0.20f;
     [SerializeField] private int boltSortingOrder = 1;
 
+    [Header("Hinge Settings")]
+    [SerializeField] private Color hingeColor = Color.green;
+    [SerializeField] private Sprite hingeSprite = null;
+    [SerializeField] private float hingeSize = 0.15f;
+    [SerializeField] private int hingeSortingOrder = 2;
+
+    // ????????????????????????????????????????????????
+    // OUTLINE COLOURS
+    // ????????????????????????????????????????????????
+
+    [Header("Selection Outlines")]
+    [SerializeField] private Color selectionBorderMain = new(0f, 1f, 1f, 0.80f);
+    [SerializeField] private Color selectionBorderSecondary = new(0f, 1f, 1f, 0.35f);
+
+    // ????????????????????????????????????????????????
+    // COMMON / UI
+    // ????????????????????????????????????????????????
+
+    [Header("Common Settings")]
     [SerializeField] public float defaultMass = 33f;
 
-    // New cursor sprites:
-    [SerializeField] public Sprite cursorDragSprite = null;
-    [SerializeField] public Sprite cursorScaleSprite = null;
+    [Header("Cursor Textures")]
+    [SerializeField] public Texture2D cursorDefaultTexture = null;
+    [SerializeField] public Texture2D cursorDragTexture = null;
+    [SerializeField] public Texture2D cursorScaleTexture = null;
 
-    private bool isFrozen = false;
+    [Header("Freeze UI")]
+    public Image freezeIndicator;
+
+    private bool Frozen => Time.timeScale == 0f;
+
+    // ????????????????????????????????????????????????
+    // UNITY LIFECYCLE
+    // ????????????????????????????????????????????????
+
+    private void Start()
+    {
+        if (cursorDefaultTexture != null)
+        {
+            Vector2 hs = new(cursorDefaultTexture.width * 0.5f,
+                              cursorDefaultTexture.height * 0.5f);
+            Cursor.SetCursor(cursorDefaultTexture, hs, CursorMode.Auto);
+        }
+        if (freezeIndicator) freezeIndicator.enabled = false;
+    }
 
     private void Update()
     {
-        if (Input.GetKeyDown(KeyCode.S))
-            SpawnSquare();
-        if (Input.GetKeyDown(KeyCode.F))
-            ToggleFreeze();
-        if (Input.GetKeyDown(KeyCode.B))
+        if (Input.GetKeyDown(KeyCode.F)) ToggleFreeze();
+
+        // Left?click empty space ? deselect
+        if (Frozen && Input.GetMouseButtonDown(0))
         {
-            if (Time.timeScale == 0f)
-                CreateJointAtMouse(JointType.Bolt);
+            if (Physics2D.OverlapPoint(GetWorldMouse()) == null)
+                Part.ClearSelection();
         }
-        if (Input.GetKeyDown(KeyCode.H))
-        {
-            if (Time.timeScale == 0f)
-                CreateJointAtMouse(JointType.Hinge);
-        }
+
+        if (!Frozen) return;
+
+        if (Input.GetKeyDown(KeyCode.S)) SpawnSquare();
+        if (Input.GetKeyDown(KeyCode.C)) SpawnCircle();
+        if (Input.GetKeyDown(KeyCode.B)) CreateJointAtMouse(JointType.Bolt);
+        if (Input.GetKeyDown(KeyCode.H)) CreateJointAtMouse(JointType.Hinge);
     }
+
+    // ????????????????????????????????????????????????
+    // SPAWNING
+    // ????????????????????????????????????????????????
 
     private void SpawnSquare()
     {
-        Vector3 spawnPos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        spawnPos.z = 0f;
-        GameObject square = new GameObject("Part");
-        square.transform.position = spawnPos;
-        square.transform.localScale = Vector3.one;
-        square.transform.parent = transform;
-        SpriteRenderer sr = square.AddComponent<SpriteRenderer>();
-        sr.color = spawnColor;
-        if (squareSprite != null)
-            sr.sprite = squareSprite;
-        sr.sortingOrder = squareSortingOrder;
-        Rigidbody2D rb = square.AddComponent<Rigidbody2D>();
-        rb.gravityScale = 1f;
-        square.AddComponent<BoxCollider2D>();
-        square.AddComponent<Part>();
-        Part partScript = square.GetComponent<Part>();
-        partScript.spawner = this;
-        partScript.mass = defaultMass;
-        rb.mass = defaultMass;
+        Vector3 pos = GridSnapping.SnapPos(GetWorldMouse());
+
+        GameObject partObj = new("Part");
+        partObj.transform.SetPositionAndRotation(pos, Quaternion.identity);
+        partObj.transform.localScale = Vector3.one;
+        partObj.transform.parent = transform;
+
+        partObj.AddComponent<BoxCollider2D>();               // collider first
+        FinalisePartObject(partObj, squareSprite, spawnSquareColor, squareSortingOrder);
     }
+
+    private void SpawnCircle()
+    {
+        Vector3 pos = GridSnapping.SnapPos(GetWorldMouse());
+
+        GameObject partObj = new("Part");
+        partObj.transform.SetPositionAndRotation(pos, Quaternion.identity);
+        partObj.transform.localScale = Vector3.one;
+        partObj.transform.parent = transform;
+
+        partObj.AddComponent<CircleCollider2D>();            // collider first
+        FinalisePartObject(partObj, circleSprite, spawnCircleColor, circleSortingOrder);
+    }
+
+    private void FinalisePartObject(GameObject partObj, Sprite sprite,
+                                    Color col, int order)
+    {
+        // Sprite
+        SpriteRenderer sr = partObj.AddComponent<SpriteRenderer>();
+        sr.color = col; sr.sprite = sprite; sr.sortingOrder = order;
+
+        // Physics
+        Rigidbody2D rb = partObj.AddComponent<Rigidbody2D>();
+        rb.gravityScale = 1f; rb.mass = defaultMass;
+
+        // Behaviour
+        Part part = partObj.AddComponent<Part>();
+        part.spawner = this;
+        part.mass = defaultMass;
+        part.SetCursorTextures(cursorDragTexture, cursorScaleTexture, cursorDefaultTexture);
+        part.SetSelectionColours(selectionBorderMain, selectionBorderSecondary);
+
+        // Newly spawned part becomes the active selection
+        part.SelectAsSingle();
+    }
+
+    // ????????????????????????????????????????????????
+    // JOINT CREATION
+    // ????????????????????????????????????????????????
+
+    private void CreateJointAtMouse(JointType type)
+    {
+        if (!Frozen) return;
+
+        Vector3 snapPos = GridSnapping.SnapPos(GetWorldMouse());
+        const float detectRadius = 0.05f;
+        Collider2D[] hits = Physics2D.OverlapCircleAll(snapPos, detectRadius);
+
+        var parts = new List<Part>();
+        foreach (Collider2D h in hits)
+            if (h.TryGetComponent(out Part p) && !parts.Contains(p))
+                parts.Add(p);
+
+        if (parts.Count != 2) return;
+        if (IsConnectionAtPoint(snapPos)) return;
+
+        Part a = parts[0]; Part b = parts[1];
+
+        GameObject conn = new(type.ToString());
+        conn.transform.position = snapPos;
+        conn.transform.SetParent(b.transform, true);
+
+        SpriteRenderer sr = conn.AddComponent<SpriteRenderer>();
+        if (type == JointType.Bolt)
+        {
+            sr.color = boltColor; sr.sprite = boltSprite; sr.sortingOrder = boltSortingOrder;
+        }
+        else
+        {
+            sr.color = hingeColor; sr.sprite = hingeSprite; sr.sortingOrder = hingeSortingOrder;
+        }
+
+        Vector3 desired = type == JointType.Bolt ? Vector3.one * boltSize
+                                                 : Vector3.one * hingeSize;
+        Vector3 parentScale = b.transform.lossyScale;
+        conn.transform.localScale = new(desired.x / parentScale.x,
+                                        desired.y / parentScale.y, 1f);
+
+        Rigidbody2D rbA = a.GetComponent<Rigidbody2D>();
+        if (type == JointType.Bolt)
+        {
+            var j = b.gameObject.AddComponent<FixedJoint2D>();
+            j.connectedBody = rbA; j.enableCollision = false; j.anchor = conn.transform.localPosition;
+        }
+        else
+        {
+            var j = b.gameObject.AddComponent<HingeJoint2D>();
+            j.connectedBody = rbA; j.enableCollision = false; j.anchor = conn.transform.localPosition;
+        }
+
+        a.AddConnectedPart(b); b.AddConnectedPart(a);
+    }
+
+    private static bool IsConnectionAtPoint(Vector3 wp)
+    {
+        const float eps2 = 1e-6f;
+        // modern, non?deprecated API
+        foreach (var j in Object.FindObjectsByType<AnchoredJoint2D>(FindObjectsSortMode.None))
+        {
+            if ((j.transform.TransformPoint(j.anchor) - wp).sqrMagnitude < eps2) return true;
+        }
+        return false;
+    }
+
+    // ????????????????????????????????????????????????
+    // UTILITY
+    // ????????????????????????????????????????????????
 
     private void ToggleFreeze()
     {
-        isFrozen = !isFrozen;
-        Time.timeScale = isFrozen ? 0f : 1f;
+        Time.timeScale = Time.timeScale == 0f ? 1f : 0f;
+        if (freezeIndicator) freezeIndicator.enabled = Frozen;
     }
 
-    // Generic joint creation: connects exactly two parts.
-    private void CreateJointAtMouse(JointType type)
+    private Vector3 GetWorldMouse()
     {
-        Vector3 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        mousePos.z = 0f;
-        Collider2D[] colliders = Physics2D.OverlapPointAll(mousePos);
-        List<Part> partsUnderMouse = new List<Part>();
-        foreach (Collider2D col in colliders)
-        {
-            Part part = col.GetComponent<Part>();
-            if (part != null && !partsUnderMouse.Contains(part))
-                partsUnderMouse.Add(part);
-        }
-        if (partsUnderMouse.Count < 2)
-            return;
-
-        // Connect only the first two parts.
-        Part partA = partsUnderMouse[0];
-        Part partB = partsUnderMouse[1];
-
-        if (type == JointType.Bolt)
-        {
-            FixedJoint2D joint = partB.gameObject.AddComponent<FixedJoint2D>();
-            joint.connectedBody = partA.GetComponent<Rigidbody2D>();
-            joint.enableCollision = false;
-            // Create a connector object as a child of partB.
-            GameObject connector = new GameObject("Bolt");
-            connector.transform.position = mousePos;
-            connector.transform.parent = partB.transform;
-            SpriteRenderer connSR = connector.AddComponent<SpriteRenderer>();
-            connSR.color = boltColor;
-            if (boltSprite != null)
-                connSR.sprite = boltSprite;
-            connSR.sortingOrder = boltSortingOrder;
-            connector.transform.localScale = new Vector3(boltSize, boltSize, 1);
-            joint.anchor = connector.transform.localPosition;
-        }
-        else if (type == JointType.Hinge)
-        {
-            HingeJoint2D joint = partB.gameObject.AddComponent<HingeJoint2D>();
-            joint.connectedBody = partA.GetComponent<Rigidbody2D>();
-            joint.enableCollision = false;
-            GameObject connector = new GameObject("Hinge");
-            connector.transform.position = mousePos;
-            connector.transform.parent = partB.transform;
-            SpriteRenderer connSR = connector.AddComponent<SpriteRenderer>();
-            connSR.color = hingeColor;
-            if (hingeSprite != null)
-                connSR.sprite = hingeSprite;
-            connSR.sortingOrder = hingeSortingOrder;
-            connector.transform.localScale = new Vector3(hingeSize, hingeSize, 1);
-            joint.anchor = connector.transform.localPosition;
-        }
-
-        // Register the direct connection between partA and partB.
-        partA.AddConnectedPart(partB);
-        partB.AddConnectedPart(partA);
+        Vector3 wp = Camera.main.ScreenToWorldPoint(Input.mousePosition);
+        wp.z = 0f; return wp;
     }
 }

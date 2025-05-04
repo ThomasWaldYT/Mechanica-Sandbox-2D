@@ -1,404 +1,447 @@
+// Part.cs – selection, dragging, scaling, rotation, mass slider
+// 2025?05?06  (right?click selection & mass?menu fix)
+
 using UnityEngine;
 using System.Collections.Generic;
 
 public class Part : MonoBehaviour
 {
-    public Spawner spawner; // Reference to the spawner
+    // ????????????????????????????????????????????????
+    // STATIC SELECTION DATA
+    // ????????????????????????????????????????????????
+
+    public static bool IsInteracting { get; private set; }
+
+    private static readonly List<Part> currentGroup = new();
+    private static Part mainSelected = null;
+    private static Color mainColour = Color.cyan;
+    private static Color secondaryColour = new(0f, 1f, 1f, 0.35f);
+
+    public static void ClearSelection()
+    {
+        foreach (Part p in currentGroup) p.HideOutline();
+        currentGroup.Clear(); mainSelected = null;
+    }
+
+    // ????????????????????????????????????????????????
+    // PUBLIC HELPERS
+    // ????????????????????????????????????????????????
+
+    public void SetCursorTextures(Texture2D move, Texture2D scale, Texture2D def)
+    { curMove = move; curScale = scale; curDefault = def; }
+
+    public void SetSelectionColours(Color main, Color secondary)
+    { mainColour = main; secondaryColour = secondary; }
+
+    public void SelectAsSingle()
+    {
+        ClearSelection();
+        currentGroup.Add(this); mainSelected = this;
+        ShowOutline(mainColour);
+    }
+
+    // ????????????????????????????????????????????????
+    // INSPECTOR / REFERENCES
+    // ????????????????????????????????????????????????
+
+    [HideInInspector] public Spawner spawner;
+
+    [Header("Cursor Textures")]
+    [SerializeField] private Texture2D curMove;
+    [SerializeField] private Texture2D curScale;
+    [SerializeField] private Texture2D curDefault;
+
+    [Header("Mass (affects brightness)")]
+    [Range(1, 100)] public float mass = 33f;
+
+    // ????????????????????????????????????????????????
+    // OUTLINE
+    // ????????????????????????????????????????????????
+
+    private const float LINE_WIDTH = 0.05f;
+    private const int CIRCLE_SEGMENTS = 40;
+    private LineRenderer outline;
+
+    // ????????????????????????????????????????????????
+    // PRIVATE STATE
+    // ????????????????????????????????????????????????
 
     private Rigidbody2D rb;
     private Collider2D col;
     private SpriteRenderer sr;
-    private Vector3 moveOffset;
-    private Vector3 fixedEdgeWorldPos;
 
-    private enum DragMode { None, Move, ResizeLeft, ResizeRight, ResizeTop, ResizeBottom }
-    private DragMode currentDragMode = DragMode.None;
+    private float baseHue, baseSat;
 
-    [SerializeField] private float edgeThreshold = 0.15f;
-    [SerializeField] private float minWidth = 0.2f;
-    [SerializeField] private float minHeight = 0.2f;
-    [SerializeField] private float groupRotationSpeed = 5f; // degrees per frame when rotating
+    private enum DragMode { None, Move, ScaleX, ScaleY, ScaleCircle }
+    private DragMode dragMode = DragMode.None;
 
-    // Mass value, range 1–100; brightness (V) is proportional to mass.
-    public float mass = 33f;
+    private Vector3 dragStartMouse;
+    private readonly Dictionary<Part, Vector3> startPos = new();
+    private Vector3 groupCentroid;
 
-    private float currentWidth = 1f;
-    private float currentHeight = 1f;
-    private bool isFrozenDrag = false;
+    // Right?click selection helpers
+    private bool rightHeld = false;
+    private Vector3 rightStart;
+    private const float RIGHT_DRAG_THRESHOLD = 0.2f;
 
-    // List of parts directly connected to this part.
-    private List<Part> connectedParts = new List<Part>();
+    private bool showMassUI;
 
-    // For group dragging, we use this list to store the group (computed on demand).
-    private List<Part> dragGroup = new List<Part>();
+    private const float EDGE_BAND = 0.15f;
+    private const float ROTATE_STEP = GridSnapping.AngleSnap;
+    private float MIN_DIM => GridSnapping.ScaleGrid;
+    private bool Frozen => Time.timeScale == 0f;
 
-    private Vector3 lastGroupMousePos;
-    private Vector3 lastDragMousePos;
-
-    // For mass slider UI
-    private bool showMassSlider = false;
-    private float sliderWidth = 500f;
-    private float sliderHeight = 100f;
-
-    // Base HSV values from the initial color.
-    private float baseHue;
-    private float baseSat;
+    // ????????????????????????????????????????????????
+    // INITIALISATION
+    // ????????????????????????????????????????????????
 
     private void Awake()
     {
         rb = GetComponent<Rigidbody2D>();
         col = GetComponent<Collider2D>();
         sr = GetComponent<SpriteRenderer>();
-        transform.localScale = new Vector3(currentWidth, currentHeight, 1);
+
+        if (sr) Color.RGBToHSV(sr.color, out baseHue, out baseSat, out _);
+
+        BuildOutline(); HideOutline();
+    }
+
+    private void Start() { rb.mass = mass; UpdateBrightness(); }
+
+    // ????????????????????????????????????????????????
+    // OUTLINE BUILD / UPDATE
+    // ????????????????????????????????????????????????
+
+    private void BuildOutline()
+    {
+        outline = new GameObject("Outline").AddComponent<LineRenderer>();
+        outline.transform.SetParent(transform, false);
+        outline.useWorldSpace = false; outline.loop = true;
+        outline.startWidth = outline.endWidth = LINE_WIDTH;
+        outline.material = new Material(Shader.Find("Sprites/Default"));
+        outline.sortingOrder = sr ? sr.sortingOrder + 50 : 50;
+        outline.numCornerVertices = 2;
+        RecalculateOutline();
+    }
+
+    private void LateUpdate()
+    {
+        if (outline.enabled && transform.hasChanged)
+        { RecalculateOutline(); transform.hasChanged = false; }
+    }
+
+    private void RecalculateOutline()
+    {
+        if (col == null) return;
+
+        // Circle
+        if (col is CircleCollider2D circle)
+        {
+            float r = circle.radius * Mathf.Max(transform.localScale.x, transform.localScale.y);
+            outline.positionCount = CIRCLE_SEGMENTS;
+            for (int i = 0; i < CIRCLE_SEGMENTS; ++i)
+            {
+                float a = i * Mathf.PI * 2f / CIRCLE_SEGMENTS;
+                outline.SetPosition(i, new(Mathf.Cos(a) * r, Mathf.Sin(a) * r, 0f));
+            }
+            return;
+        }
+
+        // Box
         if (col is BoxCollider2D box)
         {
-            box.size = new Vector2(1, 1);
-            box.offset = Vector2.zero;
+            Vector2 off = box.offset;
+            Vector2 half = box.size * 0.5f;
+            outline.positionCount = 4;
+            outline.SetPosition(0, new(off.x - half.x, off.y - half.y));
+            outline.SetPosition(1, new(off.x - half.x, off.y + half.y));
+            outline.SetPosition(2, new(off.x + half.x, off.y + half.y));
+            outline.SetPosition(3, new(off.x + half.x, off.y - half.y));
+            return;
         }
-        Color.RGBToHSV(sr.color, out baseHue, out baseSat, out _);
+
+        // Fallback – bounds
+        Bounds b = col.bounds;
+        Vector3 l = transform.InverseTransformPoint(b.min);
+        Vector3 h = transform.InverseTransformPoint(b.max);
+        outline.positionCount = 4;
+        outline.SetPosition(0, new(l.x, l.y));
+        outline.SetPosition(1, new(l.x, h.y));
+        outline.SetPosition(2, new(h.x, h.y));
+        outline.SetPosition(3, new(h.x, l.y));
     }
 
-    private void Start()
-    {
-        if (spawner != null)
-            mass = spawner.defaultMass;
-        else
-            mass = 33f;
-        rb.mass = mass;
-        Color newColor = Color.HSVToRGB(baseHue, baseSat, mass / 100f);
-        newColor.a = sr.color.a;
-        sr.color = newColor;
-    }
+    private void ShowOutline(Color c)
+    { outline.startColor = outline.endColor = c; outline.enabled = true; }
 
-    // Public method to register a direct connection.
-    public void AddConnectedPart(Part other)
-    {
-        if (!connectedParts.Contains(other))
-            connectedParts.Add(other);
-    }
+    private void HideOutline() => outline.enabled = false;
 
-    // Recursively get the connected group (direct connections only).
-    public List<Part> GetConnectedGroup()
-    {
-        List<Part> group = new List<Part>();
-        HashSet<Part> visited = new HashSet<Part>();
-        Queue<Part> queue = new Queue<Part>();
-        queue.Enqueue(this);
-        visited.Add(this);
-        while (queue.Count > 0)
-        {
-            Part current = queue.Dequeue();
-            group.Add(current);
-            foreach (Part p in current.connectedParts)
-            {
-                if (!visited.Contains(p))
-                {
-                    visited.Add(p);
-                    queue.Enqueue(p);
-                }
-            }
-        }
-        return group;
-    }
-
-    // --- Cursor Handling ---
-    private void OnMouseOver()
-    {
-        Vector3 worldMouse = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        worldMouse.z = 0f;
-        Vector3 localMouse = transform.InverseTransformPoint(worldMouse);
-        float halfLocalSize = 0.5f;
-        float distLeft = Mathf.Abs(localMouse.x + halfLocalSize);
-        float distRight = Mathf.Abs(localMouse.x - halfLocalSize);
-        float distTop = Mathf.Abs(localMouse.y - halfLocalSize);
-        float distBottom = Mathf.Abs(localMouse.y + halfLocalSize);
-        float minDist = Mathf.Min(distLeft, distRight, distTop, distBottom);
-        // Only show scaling cursor if part is single.
-        if (minDist < edgeThreshold && GetConnectedGroup().Count == 1)
-        {
-            if (spawner != null && spawner.cursorScaleSprite != null)
-                Cursor.SetCursor(spawner.cursorScaleSprite.texture,
-                    new Vector2(spawner.cursorScaleSprite.texture.width / 2, spawner.cursorScaleSprite.texture.height / 2),
-                    CursorMode.Auto);
-        }
-        else
-        {
-            if (spawner != null && spawner.cursorDragSprite != null)
-                Cursor.SetCursor(spawner.cursorDragSprite.texture,
-                    new Vector2(spawner.cursorDragSprite.texture.width / 2, spawner.cursorDragSprite.texture.height / 2),
-                    CursorMode.Auto);
-        }
-        if (Input.GetMouseButtonDown(1))
-            showMassSlider = !showMassSlider;
-    }
-
-    private void OnMouseExit()
-    {
-        Cursor.SetCursor(null, Vector2.zero, CursorMode.Auto);
-    }
-    // --- End Cursor Handling ---
-
-    private void OnGUI()
-    {
-        if (showMassSlider)
-        {
-            Vector3 screenPos = Camera.main.WorldToScreenPoint(transform.position);
-            float guiY = Screen.height - screenPos.y;
-            Rect sliderRect = new Rect(screenPos.x - sliderWidth / 2, guiY - 200, sliderWidth, sliderHeight);
-            if (Event.current.type == EventType.MouseDown && Event.current.button == 0 && !sliderRect.Contains(Event.current.mousePosition))
-                showMassSlider = false;
-            GUI.Label(new Rect(sliderRect.x, sliderRect.y - 30, sliderWidth, 30), "Mass: " + mass.ToString("F0"), new GUIStyle() { fontSize = 24 });
-            float newMass = GUI.HorizontalSlider(sliderRect, mass, 1f, 100f);
-            if (!Mathf.Approximately(newMass, mass))
-            {
-                mass = newMass;
-                rb.mass = mass;
-                Color updatedColor = Color.HSVToRGB(baseHue, baseSat, mass / 100f);
-                updatedColor.a = sr.color.a;
-                sr.color = updatedColor;
-            }
-        }
-    }
+    // ????????????????????????????????????????????????
+    // MOUSE INPUT
+    // ????????????????????????????????????????????????
 
     private void OnMouseDown()
     {
-        currentDragMode = DragMode.None;
-        moveOffset = Vector3.zero;
-        isFrozenDrag = false;
-        if (col != null && !col.enabled)
-            col.enabled = true;
-        isFrozenDrag = (Time.timeScale == 0f);
+        if (!Frozen) return;
 
-        Vector3 worldMouse = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        worldMouse.z = 0f;
-        lastDragMousePos = worldMouse;
-
-        List<Part> group = GetConnectedGroup();
-        if (group.Count > 1)
+        // Right?button ?
+        if (Input.GetMouseButtonDown(1))
         {
-            dragGroup = group;
-            lastGroupMousePos = worldMouse;
-        }
-        else
-        {
-            dragGroup.Clear();
-            moveOffset = transform.position - worldMouse;
+            rightHeld = true;
+            rightStart = GetWorldMouse();
+            return;
         }
 
-        if (Time.timeScale != 0f)
+        // Left?button ?
+        if (Input.GetMouseButtonDown(0))
         {
-            if (dragGroup.Count > 0)
-            {
-                foreach (Part p in dragGroup)
-                {
-                    Rigidbody2D rbTemp = p.GetComponent<Rigidbody2D>();
-                    if (rbTemp != null)
-                    {
-                        rbTemp.bodyType = RigidbodyType2D.Kinematic;
-                        rbTemp.linearVelocity = Vector2.zero;
-                        rbTemp.angularVelocity = 0f;
-                    }
-                }
-            }
-            else if (rb != null)
-            {
-                rb.bodyType = RigidbodyType2D.Kinematic;
-                rb.linearVelocity = Vector2.zero;
-                rb.angularVelocity = 0f;
-            }
-        }
-
-        Vector3 localMouse = transform.InverseTransformPoint(worldMouse);
-        float halfSize = 0.5f;
-        float distLeft = Mathf.Abs(localMouse.x + halfSize);
-        float distRight = Mathf.Abs(localMouse.x - halfSize);
-        float distTop = Mathf.Abs(localMouse.y - halfSize);
-        float distBottom = Mathf.Abs(localMouse.y + halfSize);
-        float minDist = Mathf.Min(distLeft, distRight, distTop, distBottom);
-        // Allow scaling only if this part is single.
-        if (minDist < edgeThreshold && GetConnectedGroup().Count == 1)
-        {
-            if (minDist == distLeft)
-            {
-                currentDragMode = DragMode.ResizeLeft;
-                fixedEdgeWorldPos = transform.position + Vector3.right * (currentWidth / 2f);
-            }
-            else if (minDist == distRight)
-            {
-                currentDragMode = DragMode.ResizeRight;
-                fixedEdgeWorldPos = transform.position - Vector3.right * (currentWidth / 2f);
-            }
-            else if (minDist == distTop)
-            {
-                currentDragMode = DragMode.ResizeTop;
-                fixedEdgeWorldPos = transform.position - Vector3.up * (currentHeight / 2f);
-            }
-            else if (minDist == distBottom)
-            {
-                currentDragMode = DragMode.ResizeBottom;
-                fixedEdgeWorldPos = transform.position + Vector3.up * (currentHeight / 2f);
-            }
-        }
-        else
-        {
-            currentDragMode = DragMode.Move;
+            SelectGroup();
+            BeginDrag();
         }
     }
 
     private void OnMouseDrag()
     {
-        Vector3 worldMouse = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        worldMouse.z = 0f;
+        if (!Frozen) return;
 
-        // If in scaling mode (allowed only for single parts)
-        if (currentDragMode == DragMode.ResizeLeft || currentDragMode == DragMode.ResizeRight ||
-            currentDragMode == DragMode.ResizeTop || currentDragMode == DragMode.ResizeBottom)
+        // Cancel right?click if user pans
+        if (rightHeld && Input.GetMouseButton(1))
         {
-            if (GetConnectedGroup().Count == 1)
-            {
-                if (currentDragMode == DragMode.ResizeLeft)
-                {
-                    float oldLeft = transform.position.x - (currentWidth / 2f);
-                    float newLeft = worldMouse.x;
-                    float delta = oldLeft - newLeft;
-                    float newWidth = currentWidth + delta;
-                    if (newWidth < minWidth) { delta = minWidth - currentWidth; newWidth = minWidth; }
-                    Vector3 newPos = transform.position;
-                    newPos.x -= delta / 2f;
-                    currentWidth = newWidth;
-                    transform.position = newPos;
-                    transform.localScale = new Vector3(currentWidth, currentHeight, 1);
-                }
-                else if (currentDragMode == DragMode.ResizeRight)
-                {
-                    float oldRight = transform.position.x + (currentWidth / 2f);
-                    float newRight = worldMouse.x;
-                    float delta = newRight - oldRight;
-                    float newWidth = currentWidth + delta;
-                    if (newWidth < minWidth) { delta = minWidth - currentWidth; newWidth = minWidth; }
-                    Vector3 newPos = transform.position;
-                    newPos.x += delta / 2f;
-                    currentWidth = newWidth;
-                    transform.position = newPos;
-                    transform.localScale = new Vector3(currentWidth, currentHeight, 1);
-                }
-                else if (currentDragMode == DragMode.ResizeTop)
-                {
-                    float oldTop = transform.position.y + (currentHeight / 2f);
-                    float newTop = worldMouse.y;
-                    float delta = newTop - oldTop;
-                    float newHeight = currentHeight + delta;
-                    if (newHeight < minHeight) { delta = minHeight - currentHeight; newHeight = minHeight; }
-                    Vector3 newPos = transform.position;
-                    newPos.y += delta / 2f;
-                    currentHeight = newHeight;
-                    transform.position = newPos;
-                    transform.localScale = new Vector3(currentWidth, currentHeight, 1);
-                }
-                else if (currentDragMode == DragMode.ResizeBottom)
-                {
-                    float oldBottom = transform.position.y - (currentHeight / 2f);
-                    float newBottom = worldMouse.y;
-                    float delta = oldBottom - newBottom;
-                    float newHeight = currentHeight + delta;
-                    if (newHeight < minHeight) { delta = minHeight - currentHeight; newHeight = minHeight; }
-                    Vector3 newPos = transform.position;
-                    newPos.y -= delta / 2f;
-                    currentHeight = newHeight;
-                    transform.position = newPos;
-                    transform.localScale = new Vector3(currentWidth, currentHeight, 1);
-                }
-            }
+            if (Vector3.Distance(GetWorldMouse(), rightStart) > RIGHT_DRAG_THRESHOLD)
+                rightHeld = false;
         }
-        else
-        {
-            // Apply translation.
-            Vector3 translationDelta = worldMouse - lastDragMousePos;
-            lastDragMousePos = worldMouse;
-            if (dragGroup.Count > 0)
-            {
-                foreach (Part p in dragGroup)
-                    p.transform.position += translationDelta;
-                lastGroupMousePos = worldMouse;
-            }
-            else
-            {
-                transform.position += translationDelta;
-            }
 
-            // Independently, if R is held, apply a fixed rotation.
-            if (Input.GetKey(KeyCode.R))
-            {
-                float rotationDelta = groupRotationSpeed; // fixed angle per frame.
-                if (dragGroup.Count > 0)
-                {
-                    Vector3 groupCenter = Vector3.zero;
-                    foreach (Part p in dragGroup)
-                        groupCenter += p.transform.position;
-                    groupCenter /= dragGroup.Count;
-                    foreach (Part p in dragGroup)
-                    {
-                        Vector3 offset = p.transform.position - groupCenter;
-                        offset = Quaternion.Euler(0, 0, rotationDelta) * offset;
-                        p.transform.position = groupCenter + offset;
-                        p.transform.rotation = p.transform.rotation * Quaternion.Euler(0, 0, rotationDelta);
-                    }
-                }
-                else
-                {
-                    transform.rotation = transform.rotation * Quaternion.Euler(0, 0, rotationDelta);
-                }
-            }
-        }
+        // Left drag ? transform
+        if (Input.GetMouseButton(0)) ContinueDrag();
     }
 
     private void OnMouseUp()
     {
-        currentDragMode = DragMode.None;
-        isFrozenDrag = false;
-        if (Time.timeScale != 0f)
+        // Right?button released (only fires if cursor still over this collider)
+        if (Input.GetMouseButtonUp(1) && rightHeld)
         {
-            if (dragGroup.Count > 0)
-            {
-                foreach (Part p in dragGroup)
-                {
-                    Rigidbody2D rbTemp = p.GetComponent<Rigidbody2D>();
-                    if (rbTemp != null)
-                    {
-                        rbTemp.bodyType = RigidbodyType2D.Dynamic;
-                        rbTemp.linearVelocity = Vector2.zero;
-                        rbTemp.angularVelocity = 0f;
-                    }
-                }
-            }
-            else if (rb != null)
-            {
-                rb.bodyType = RigidbodyType2D.Dynamic;
-                rb.linearVelocity = Vector2.zero;
-                rb.angularVelocity = 0f;
-            }
+            SelectGroup();
+            showMassUI = !showMassUI; // toggle mass UI
+            rightHeld = false;
         }
-        dragGroup.Clear();
-        if (col != null)
-        {
-            col.enabled = false;
-            Physics2D.SyncTransforms();
-            col.enabled = true;
-        }
+
+        if (Input.GetMouseButtonUp(0)) EndDrag();
     }
 
-    private void Update()
+    private void OnMouseOver()
     {
-        if (!Input.GetMouseButton(0) && currentDragMode != DragMode.None)
-        {
-            currentDragMode = DragMode.None;
-            isFrozenDrag = false;
-            dragGroup.Clear();
-        }
+        if (!Frozen) return;
+        DragMode m = DetectMode(GetWorldMouse());
+        ApplyCursor(m == DragMode.Move ? curMove : curScale);
     }
 
-    private void OnJointBreak2D(Joint2D brokenJoint)
+    private void OnMouseExit() { ApplyCursor(curDefault); }
+
+    // ????????????????????????????????????????????????
+    // SELECTION
+    // ????????????????????????????????????????????????
+
+    private void SelectGroup()
     {
-        Debug.Log(gameObject.name + " joint broke: " + brokenJoint.name);
+        if (mainSelected == this) return;
+
+        ClearSelection();
+        List<Part> grp = GetGroup();
+        currentGroup.AddRange(grp);
+        mainSelected = this;
+
+        foreach (Part p in grp)
+            p.ShowOutline(p == this ? mainColour : secondaryColour);
+    }
+
+    // ????????????????????????????????????????????????
+    // DRAGGING / TRANSFORM
+    // ????????????????????????????????????????????????
+
+    private void BeginDrag()
+    {
+        IsInteracting = true;
+        dragMode = DetectMode(GetWorldMouse());
+
+        var grp = GetGroup();
+        startPos.Clear(); groupCentroid = Vector3.zero;
+        foreach (Part p in grp)
+        { startPos[p] = p.transform.position; groupCentroid += p.transform.position; }
+        groupCentroid /= grp.Count;
+        dragStartMouse = GetWorldMouse();
+    }
+
+    private void ContinueDrag()
+    {
+        Vector3 curMouse = GetWorldMouse();
+        Vector3 rawDelta = curMouse - dragStartMouse;
+
+        if (Input.GetKeyDown(KeyCode.R))
+        {
+            RotateSelection();
+            foreach (Part p in startPos.Keys) startPos[p] = p.transform.position;
+            groupCentroid = GetCurrentCentroid();
+            dragStartMouse = curMouse; Physics2D.SyncTransforms(); return;
+        }
+
+        if (dragMode == DragMode.ScaleX || dragMode == DragMode.ScaleY || dragMode == DragMode.ScaleCircle)
+        { HandleScaling(curMouse); Physics2D.SyncTransforms(); return; }
+
+        Vector3 snappedDelta = startPos.Count > 1
+                               ? GridSnapping.SnapPos(groupCentroid + rawDelta) - groupCentroid
+                               : GridSnapping.SnapPos(startPos[this] + rawDelta) - startPos[this];
+
+        foreach (var kv in startPos) kv.Key.transform.position = kv.Value + snappedDelta;
+        Physics2D.SyncTransforms();
+    }
+
+    private void EndDrag()
+    { IsInteracting = false; dragMode = DragMode.None; startPos.Clear(); }
+
+    private void RotateSelection()
+    {
+        Vector3 pivot = GetCurrentCentroid();
+        Quaternion q = Quaternion.Euler(0, 0, ROTATE_STEP);
+
+        foreach (var kv in startPos)
+        {
+            Vector3 off = kv.Key.transform.position - pivot;
+            kv.Key.transform.position = pivot + q * off;
+            kv.Key.transform.rotation *= q;
+        }
+
+        Vector3 drift = pivot - GetCurrentCentroid();
+        if (drift.sqrMagnitude > 1e-6f)
+            foreach (var kv in startPos) kv.Key.transform.position += drift;
+    }
+
+    private Vector3 GetCurrentCentroid()
+    {
+        Vector3 sum = Vector3.zero;
+        foreach (var kv in startPos) sum += kv.Key.transform.position;
+        return sum / startPos.Count;
+    }
+
+    private void HandleScaling(Vector3 worldMouse)
+    {
+        if (dragMode == DragMode.ScaleCircle)
+        {
+            float radius = Mathf.Clamp(Vector3.Distance(worldMouse, transform.position),
+                                       MIN_DIM * 0.5f, 999f);
+            transform.localScale = Vector3.one * GridSnapping.SnapScale(radius * 2f);
+            return;
+        }
+
+        Vector3 dir = dragMode == DragMode.ScaleX ? transform.right : transform.up;
+        float proj = Vector3.Dot(worldMouse - transform.position, dir);
+        float half = Mathf.Clamp(Mathf.Abs(proj), MIN_DIM * 0.5f, 999f);
+        float snap = GridSnapping.SnapScale(half * 2f);
+
+        Vector3 ls = transform.localScale;
+        if (dragMode == DragMode.ScaleX) ls.x = snap; else ls.y = snap;
+        transform.localScale = ls;
+    }
+
+    // ????????????????????????????????????????????????
+    // MODE DETECTION
+    // ????????????????????????????????????????????????
+
+    private DragMode DetectMode(Vector3 worldMouse)
+    {
+        if (GetGroup().Count > 1) return DragMode.Move;
+
+        // Circle
+        if (col is CircleCollider2D circle)
+        {
+            float dist = (transform.InverseTransformPoint(worldMouse)).magnitude;
+            return Mathf.Abs(dist - circle.radius) < EDGE_BAND
+                 ? DragMode.ScaleCircle : DragMode.Move;
+        }
+
+        // Box
+        if (col is BoxCollider2D box)
+        {
+            Vector3 local = transform.InverseTransformPoint(worldMouse) - (Vector3)box.offset;
+            float hx = box.size.x * 0.5f, hy = box.size.y * 0.5f;
+            bool nearX = Mathf.Abs(Mathf.Abs(local.x) - hx) < EDGE_BAND;
+            bool nearY = Mathf.Abs(Mathf.Abs(local.y) - hy) < EDGE_BAND;
+
+            if (nearX && !nearY) return DragMode.ScaleX;
+            if (nearY && !nearX) return DragMode.ScaleY;
+            if (nearX && nearY)
+                return Mathf.Abs(Mathf.Abs(local.x) - hx) <
+                       Mathf.Abs(Mathf.Abs(local.y) - hy)
+                     ? DragMode.ScaleX : DragMode.ScaleY;
+
+            return DragMode.Move;
+        }
+
+        return DragMode.Move;
+    }
+
+    // ????????????????????????????????????????????????
+    // CONNECTIVITY
+    // ????????????????????????????????????????????????
+
+    private readonly List<Part> connected = new();
+    public void AddConnectedPart(Part p) { if (!connected.Contains(p)) connected.Add(p); }
+
+    private List<Part> GetGroup()
+    {
+        var group = new List<Part>();
+        var q = new Queue<Part>(); q.Enqueue(this);
+        var seen = new HashSet<Part> { this };
+
+        while (q.Count > 0)
+        {
+            Part cur = q.Dequeue(); group.Add(cur);
+            foreach (Part p in cur.connected) if (seen.Add(p)) q.Enqueue(p);
+        }
+        return group;
+    }
+
+    // ????????????????????????????????????????????????
+    // CURSOR & MASS UI
+    // ????????????????????????????????????????????????
+
+    private void UpdateBrightness()
+    {
+        if (!sr) return;
+        float v = Mathf.InverseLerp(1f, 100f, mass);
+        sr.color = Color.HSVToRGB(baseHue, baseSat, Mathf.Lerp(0.3f, 1f, v));
+    }
+
+    private void ApplyCursor(Texture2D tex)
+    {
+        if (tex == null) { Cursor.SetCursor(null, Vector2.zero, CursorMode.Auto); return; }
+        Cursor.SetCursor(tex, new(tex.width * 0.5f, tex.height * 0.5f), CursorMode.Auto);
+    }
+
+    private void OnGUI()
+    {
+        if (!showMassUI || !Frozen) return;
+
+        Vector3 sp = Camera.main.WorldToScreenPoint(transform.position);
+        float gy = Screen.height - sp.y;
+        const float W = 250f, H = 20f;
+        Rect r = new(sp.x - W * 0.5f, gy - 50f, W, H);
+
+        float newMass = GUI.HorizontalSlider(r, mass, 1f, 100f);
+        if (!Mathf.Approximately(newMass, mass))
+        { mass = newMass; rb.mass = mass; UpdateBrightness(); }
+
+        GUI.Label(new(r.x, r.y - 18, W, 18),
+                  "Mass " + mass.ToString("0"),
+                  new GUIStyle { alignment = TextAnchor.MiddleCenter });
+    }
+
+    // ????????????????????????????????????????????????
+    // UTILITY
+    // ????????????????????????????????????????????????
+
+    private Vector3 GetWorldMouse()
+    {
+        Vector3 wp = Camera.main.ScreenToWorldPoint(Input.mousePosition);
+        wp.z = 0f; return wp;
     }
 }
