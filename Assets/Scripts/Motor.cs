@@ -1,9 +1,9 @@
 // Motor.cs – runtime selection UI for motorised hinges
-// CHANGELOG #3 (2025-05-07)
-//   • Menu now closes on zoom (mouse?wheel scroll).
-//   • Outline colour matches normal part selection colour.
-//   • Outline is shown only while the context menu is open.
-//   • Increased menu width so "Counter-Clockwise" fits.
+// CHANGELOG #4 (2025-05-11)
+//   - Added torque slider beneath the speed slider.
+//   - Torque slider controls JointMotor2D.maxMotorTorque (range 0?1000).
+//   - Menu height and layout updated accordingly.
+//   - Keeps previous behaviour otherwise.
 
 using UnityEngine;
 using System.Collections.Generic;
@@ -52,6 +52,10 @@ public class Motor : MonoBehaviour
     private const int CIRCLE_SEGMENTS = 36;
     private const float UI_SCALE = 2f;
     private const float LINE_WIDTH = 0.05f;
+
+    // torque slider
+    private const float TORQUE_MAX = 1000f; // lifts max?mass parts easily
+    private const float TORQUE_PAD = 12f * UI_SCALE; // same vertical spacing as speed
 
     private bool Frozen => Time.timeScale == 0f;
 
@@ -133,7 +137,7 @@ public class Motor : MonoBehaviour
         GUIStyle lblStyle = new(GUI.skin.label) { fontSize = Mathf.RoundToInt(20 * UI_SCALE) };
         GUIStyle btnStyle = new(GUI.skin.button) { fontSize = Mathf.RoundToInt(20 * UI_SCALE) };
 
-        // widened menu so "Counter-Clockwise" fits
+        // widened menu so "Counter?Clockwise" fits
         float W0 = 220f, LINE_H0 = 22f, SLIDER_H0 = 18f, PAD0 = 8f;
 
         float W = W0 * UI_SCALE;
@@ -141,7 +145,10 @@ public class Motor : MonoBehaviour
         float LINE_H = LINE_H0 * UI_SCALE;
         float PAD = PAD0 * UI_SCALE;
 
-        float menuH = PAD * 2 + lblStyle.lineHeight + SLIDER_H + 12f * UI_SCALE +
+        // menu height:  speed label + slider, torque label + slider, toggle
+        float menuH = PAD * 2 +
+                      lblStyle.lineHeight + SLIDER_H + TORQUE_PAD +
+                      lblStyle.lineHeight + SLIDER_H + TORQUE_PAD +
                       LINE_H + 4f * UI_SCALE;
 
         Rect bgR = new(menuGuiPos.x + 20f * UI_SCALE,
@@ -157,31 +164,49 @@ public class Motor : MonoBehaviour
         // controls
         float y = bgR.y + PAD;
 
-        Rect labelRect = new(bgR.x + PAD, y, W - PAD * 2, lblStyle.lineHeight);
+        // speed
+        Rect speedLabelRect = new(bgR.x + PAD, y, W - PAD * 2, lblStyle.lineHeight);
         y += lblStyle.lineHeight;
 
-        Rect sliderRect = new(bgR.x + PAD, y, W - PAD * 2, SLIDER_H);
-        y += SLIDER_H + 12f * UI_SCALE;
+        Rect speedSliderRect = new(bgR.x + PAD, y, W - PAD * 2, SLIDER_H);
+        y += SLIDER_H + TORQUE_PAD;
 
+        // torque
+        Rect torqueLabelRect = new(bgR.x + PAD, y, W - PAD * 2, lblStyle.lineHeight);
+        y += lblStyle.lineHeight;
+
+        Rect torqueSliderRect = new(bgR.x + PAD, y, W - PAD * 2, SLIDER_H);
+        y += SLIDER_H + TORQUE_PAD;
+
+        // clockwise toggle
         Rect toggleRect = new(bgR.x + PAD, y, W - PAD * 2, LINE_H);
 
+        // existing motor values
         float absSpeed = Mathf.Abs(joint.motor.motorSpeed);
-        GUI.Label(labelRect, $"Speed {absSpeed:0}", lblStyle);
+        float torque = Mathf.Clamp(joint.motor.maxMotorTorque, 0f, TORQUE_MAX);
 
-        float newAbs = GUI.HorizontalSlider(sliderRect, absSpeed, 0f, 360f);
-        bool dirty = !Mathf.Approximately(newAbs, absSpeed);
+        // labels
+        GUI.Label(speedLabelRect, $"Speed {absSpeed:0}", lblStyle);
+        GUI.Label(torqueLabelRect, $"Torque {torque:0}", lblStyle);
+
+        // sliders
+        float newAbsSpeed = GUI.HorizontalSlider(speedSliderRect, absSpeed, 0f, 360f);
+        float newTorque = GUI.HorizontalSlider(torqueSliderRect, torque, 0f, TORQUE_MAX);
+
+        bool dirty = !Mathf.Approximately(newAbsSpeed, absSpeed) ||
+                     !Mathf.Approximately(newTorque, torque);
 
         bool cw = joint.motor.motorSpeed < 0f;
         bool newCw = GUI.Toggle(toggleRect, cw,
-                                cw ? "Clockwise" : "Counter-Clockwise", btnStyle);
+                                cw ? "Clockwise" : "Counter?Clockwise", btnStyle);
         if (newCw != cw) dirty = true;
 
         // apply changes
         if (dirty)
         {
             JointMotor2D m = joint.motor;
-            m.motorSpeed = newCw ? -newAbs : newAbs;
-            m.maxMotorTorque = Mathf.Infinity;
+            m.motorSpeed = newCw ? -newAbsSpeed : newAbsSpeed;
+            m.maxMotorTorque = newTorque;
             joint.motor = m;
         }
 

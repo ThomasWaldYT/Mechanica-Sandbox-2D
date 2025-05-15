@@ -1,68 +1,88 @@
-// Spawner.cs – spawning parts & joints
-// CHANGELOG #12 (2025-05-07)
-//   • Added static property SelectionBorderMain so other scripts (e.g. Motor)
-//     can use the normal selection colour for outlines.
+// Spawner.cs – spawns parts & joints
+// CHANGELOG #8 (2025-05-15)
+//   • Joint creation (Bolt / Hinge / Motor) now requires that *both* parts
+//     involved are already selected.  Only parts under the cursor that return
+//     IsSelected() are considered; if fewer than two such parts are found the
+//     hot?key does nothing.  When multiple selected parts overlap, the top two
+//     by sorting order are still chosen.
+//   • No other behaviour changed.
 
 using UnityEngine;
 using UnityEngine.UI;
 using System.Collections.Generic;
+using TMPro;
 
-// JOINT TYPES
 public enum JointType { Bolt, Hinge, Motor }
 
-// SPAWNER
 public class Spawner : MonoBehaviour
 {
-    // PART VISUALS
+    /* =======================================================================
+     *  STRUCTS – DESIGN?STATE SNAPSHOT
+     * ===================================================================== */
+    private struct PartSnapshot
+    {
+        public Vector3 position;
+        public Quaternion rotation;
+        public Vector3 scale;
+
+        public PartSnapshot(Vector3 p, Quaternion r, Vector3 s)
+        {
+            position = p;
+            rotation = r;
+            scale = s;
+        }
+    }
+
+    private readonly Dictionary<Part, PartSnapshot> savedScene = new();
+    private readonly List<Part> savedSelection = new();
+
+    /* =======================================================================
+     *  VISUALS
+     * ===================================================================== */
     [Header("Square Settings")]
     [SerializeField] private Color spawnSquareColor = Color.white;
     [SerializeField] private Sprite squareSprite = null;
-    [SerializeField] private int squareSortingOrder = 0;
 
     [Header("Circle Settings")]
     [SerializeField] private Color spawnCircleColor = Color.white;
     [SerializeField] private Sprite circleSprite = null;
-    [SerializeField] private int circleSortingOrder = 0;
 
-    // BOLT
+    [Header("Triangle Settings")]
+    [SerializeField] private Color spawnTriangleColor = Color.white;
+    [SerializeField] private Sprite triangleSprite = null;
+
     [Header("Bolt Settings")]
     [SerializeField] private Color boltColor = Color.yellow;
     [SerializeField] private Sprite boltSprite = null;
     [SerializeField] private float boltSize = 0.20f;
-    [SerializeField] private int boltSortingOrder = 1;
 
-    // HINGE
     [Header("Hinge Settings")]
     [SerializeField] private Color hingeColor = Color.green;
     [SerializeField] private Sprite hingeSprite = null;
     [SerializeField] private float hingeSize = 0.15f;
-    [SerializeField] private int hingeSortingOrder = 2;
 
-    // MOTOR
     [Header("Motor Settings")]
     [SerializeField] private Color motorColor = Color.cyan;
     [SerializeField] private Sprite motorSprite = null;
     [SerializeField] private float motorSize = 0.18f;
-    [SerializeField] private int motorSortingOrder = 2;
-    [Tooltip("Default absolute speed in °/s when a motor is first spawned")]
     [SerializeField] private float motorDefaultSpeed = 90f;
-    [Tooltip("True = clockwise (-ve speed)  False = counter?clockwise (+ve)")]
     [SerializeField] private bool motorClockwiseDefault = false;
 
-    // expose visual diameters so other scripts can keep sprites round
     public static float BoltVisualSize { get; private set; }
     public static float HingeVisualSize { get; private set; }
     public static float MotorVisualSize { get; private set; }
 
-    // expose main selection colour for other scripts
-    public static Color SelectionBorderMain { get; private set; }
-
-    // SELECTION OUTLINES
     [Header("Selection Outlines")]
     [SerializeField] private Color selectionBorderMain = new Color(0f, 1f, 1f, 0.80f);
     [SerializeField] private Color selectionBorderSecondary = new Color(0f, 1f, 1f, 0.35f);
+    public static Color SelectionBorderMain { get; private set; }
 
-    // COMMON / UI
+    [Header("Disable?Collision Outlines")]
+    [SerializeField] private Color noCollisionOutline = Color.magenta;
+    [SerializeField] private Color noCollisionOutlineExternal = Color.yellow;
+    public static Color NoCollisionOutline { get; private set; }
+    public static Color NoCollisionOutlineExternal { get; private set; }
+
     [Header("Common Settings")]
     [SerializeField] public float defaultMass = 33f;
 
@@ -74,16 +94,26 @@ public class Spawner : MonoBehaviour
     [Header("Freeze UI")]
     public Image freezeIndicator;
 
+    [Header("Auto Bring?To?Front UI Container")]
+    public GameObject autoBringUIParent;
+
+    private Button autoBringToggleButton;
+    private TMP_Text autoBringToggleText;
+
     private bool Frozen => Time.timeScale == 0f;
 
+    /* =======================================================================
+     *  UNITY LIFECYCLE
+     * ===================================================================== */
     private void Start()
     {
         BoltVisualSize = boltSize;
         HingeVisualSize = hingeSize;
         MotorVisualSize = motorSize;
 
-        // make main selection colour globally accessible
         SelectionBorderMain = selectionBorderMain;
+        NoCollisionOutline = noCollisionOutline;
+        NoCollisionOutlineExternal = noCollisionOutlineExternal;
 
         if (cursorDefaultTexture)
         {
@@ -91,15 +121,31 @@ public class Spawner : MonoBehaviour
                              cursorDefaultTexture.height * 0.5f);
             Cursor.SetCursor(cursorDefaultTexture, hs, CursorMode.Auto);
         }
-        if (freezeIndicator) freezeIndicator.enabled = false;
+
+        if (freezeIndicator)
+            freezeIndicator.enabled = false;
+        if (autoBringUIParent)
+            autoBringUIParent.SetActive(false);
+
+        if (autoBringUIParent)
+        {
+            autoBringToggleButton = autoBringUIParent.GetComponentInChildren<Button>();
+            if (autoBringToggleButton)
+            {
+                autoBringToggleButton.onClick.AddListener(ToggleAutoBring);
+                autoBringToggleText = autoBringToggleButton.GetComponentInChildren<TMP_Text>();
+                RefreshAutoBringUI();
+            }
+        }
     }
 
     private void Update()
     {
-        if (Input.GetKeyDown(KeyCode.F)) ToggleFreeze();
+        if (Input.GetKeyDown(KeyCode.F))
+            ToggleFreeze();
 
-        // clear selection when clicking empty space (but not on any context menu)
         if (Frozen && Input.GetMouseButtonDown(0) &&
+            !Part.ChoosingNoCollision &&
             Physics2D.OverlapPoint(GetWorldMouse()) == null &&
             !Part.IsPointerOverContextMenuArea() &&
             !Motor.IsPointerOverContextMenuArea())
@@ -108,48 +154,133 @@ public class Spawner : MonoBehaviour
             Motor.ClearSelection();
         }
 
-        if (!Frozen) return;
+        if (!Frozen || Part.ChoosingNoCollision) return;
 
         if (Input.GetKeyDown(KeyCode.S)) SpawnSquare();
         if (Input.GetKeyDown(KeyCode.C)) SpawnCircle();
+        if (Input.GetKeyDown(KeyCode.T)) SpawnTriangle();
         if (Input.GetKeyDown(KeyCode.B)) CreateJointAtMouse(JointType.Bolt);
         if (Input.GetKeyDown(KeyCode.H)) CreateJointAtMouse(JointType.Hinge);
         if (Input.GetKeyDown(KeyCode.M)) CreateJointAtMouse(JointType.Motor);
     }
 
-    // PART SPAWN HELPERS
-    private void SpawnSquare()
+    /* =======================================================================
+     *  FREEZE / UNFREEZE HANDLING
+     * ===================================================================== */
+    private void ToggleFreeze()
+    {
+        bool wasFrozen = Frozen;
+
+        if (wasFrozen)
+        {
+            SaveDesignState();          // leaving design mode – snapshot scene
+            Time.timeScale = 1f;
+        }
+        else
+        {
+            Time.timeScale = 0f;
+            RestoreDesignState();       // re?entering design mode – restore
+        }
+
+        bool nowFrozen = !wasFrozen;
+
+        if (freezeIndicator)
+            freezeIndicator.enabled = nowFrozen;
+        if (autoBringUIParent)
+            autoBringUIParent.SetActive(nowFrozen);
+    }
+
+    private void SaveDesignState()
+    {
+        savedScene.Clear();
+        savedSelection.Clear();
+
+        foreach (Part p in Object.FindObjectsByType<Part>(FindObjectsSortMode.None))
+        {
+            savedScene[p] = new PartSnapshot(p.transform.position,
+                                             p.transform.rotation,
+                                             p.transform.localScale);
+
+            if (p.IsSelected())
+                savedSelection.Add(p);
+        }
+    }
+
+    private void RestoreDesignState()
+    {
+        foreach (var kv in savedScene)
+        {
+            if (!kv.Key) continue;
+
+            kv.Key.transform.SetPositionAndRotation(kv.Value.position, kv.Value.rotation);
+            kv.Key.transform.localScale = kv.Value.scale;
+
+            Rigidbody2D rb = kv.Key.GetComponent<Rigidbody2D>();
+            if (rb)
+            {
+                rb.linearVelocity = Vector2.zero;
+                rb.angularVelocity = 0f;
+            }
+        }
+
+        Physics2D.SyncTransforms();
+
+        Part.ClearSelection();
+        if (savedSelection.Count > 0)
+            Part.SelectGroup(savedSelection, false);
+    }
+
+    private void ToggleAutoBring()
+    {
+        SortingOrderManager.SetAutoBring(!SortingOrderManager.AutoBringEnabled);
+        RefreshAutoBringUI();
+    }
+
+    private void RefreshAutoBringUI()
+    {
+        if (autoBringToggleText)
+            autoBringToggleText.text = SortingOrderManager.AutoBringEnabled ? "On" : "Off";
+    }
+
+    /* =======================================================================
+     *  PART SPAWN HELPERS
+     * ===================================================================== */
+    private void SpawnSquare() =>
+        SpawnGenericPart(squareSprite, spawnSquareColor,
+                         () => new GameObject("Part").AddComponent<BoxCollider2D>());
+
+    private void SpawnCircle() =>
+        SpawnGenericPart(circleSprite, spawnCircleColor,
+                         () => new GameObject("Part").AddComponent<CircleCollider2D>());
+
+    private void SpawnTriangle() =>
+        SpawnGenericPart(triangleSprite, spawnTriangleColor, () =>
+        {
+            PolygonCollider2D pc = new GameObject("Part").AddComponent<PolygonCollider2D>();
+            pc.points = new Vector2[]
+            {
+                new(-0.5f, -0.5f),
+                new( 0.5f, -0.5f),
+                new(-0.5f,  0.5f)
+            };
+            return pc;
+        });
+
+    private void SpawnGenericPart(Sprite sprite, Color colour,
+                                  System.Func<Collider2D> colliderFactory)
     {
         Vector3 pos = GridSnapping.SnapPos(GetWorldMouse());
 
-        GameObject partObj = new("Part");
-        partObj.transform.SetPositionAndRotation(pos, Quaternion.identity);
-        partObj.transform.localScale = Vector3.one;
-        partObj.transform.parent = transform;
+        Collider2D col = colliderFactory.Invoke();
+        GameObject obj = col.gameObject;
+        obj.transform.SetPositionAndRotation(pos, Quaternion.identity);
+        obj.transform.localScale = Vector3.one;
+        obj.transform.parent = transform;
 
-        partObj.AddComponent<BoxCollider2D>();
-        FinalisePartObject(partObj, squareSprite, spawnSquareColor, squareSortingOrder);
-    }
-
-    private void SpawnCircle()
-    {
-        Vector3 pos = GridSnapping.SnapPos(GetWorldMouse());
-
-        GameObject partObj = new("Part");
-        partObj.transform.SetPositionAndRotation(pos, Quaternion.identity);
-        partObj.transform.localScale = Vector3.one;
-        partObj.transform.parent = transform;
-
-        partObj.AddComponent<CircleCollider2D>();
-        FinalisePartObject(partObj, circleSprite, spawnCircleColor, circleSortingOrder);
-    }
-
-    private void FinalisePartObject(GameObject obj, Sprite sprite, Color col, int order)
-    {
         SpriteRenderer sr = obj.AddComponent<SpriteRenderer>();
-        sr.color = col;
+        sr.color = colour;
         sr.sprite = sprite;
-        sr.sortingOrder = order;
+        sr.sortingOrder = SortingOrderManager.GetNext();
 
         Rigidbody2D rb = obj.AddComponent<Rigidbody2D>();
         rb.gravityScale = 1f;
@@ -160,97 +291,110 @@ public class Spawner : MonoBehaviour
         p.mass = defaultMass;
         p.SetCursorTextures(cursorDragTexture, cursorScaleTexture, cursorDefaultTexture);
         p.SetSelectionColours(selectionBorderMain, selectionBorderSecondary);
+
+        SortingOrderManager.BringToFront(new[] { p });
         p.SelectAsSingle();
     }
 
-    // JOINT CREATION
+    /* =======================================================================
+     *  JOINT CREATION
+     * ===================================================================== */
     private void CreateJointAtMouse(JointType type)
     {
-        if (!Frozen) return;
-
         Vector3 snapPos = GridSnapping.SnapPos(GetWorldMouse());
         const float detectRadius = 0.05f;
+
+        /* ------------------------------------------------------------------
+         * Collect ONLY *selected* parts overlapping the cursor.  Both ends
+         * must be pre?selected or we refuse to create the joint.             */
         Collider2D[] hits = Physics2D.OverlapCircleAll(snapPos, detectRadius);
-
-        var parts = new List<Part>();
+        List<Part> parts = new();
         foreach (Collider2D h in hits)
-            if (h.TryGetComponent(out Part p) && !parts.Contains(p))
-                parts.Add(p);
+        {
+            if (h.TryGetComponent(out Part pt) &&
+                pt.IsSelected() &&                 // NEW: must be selected
+                !parts.Contains(pt))
+            {
+                parts.Add(pt);
+            }
+        }
 
-        if (parts.Count != 2 || IsConnectionAtPoint(snapPos)) return;
+        /* Need at least two selected parts under the cursor. */
+        if (parts.Count < 2 || IsConnectionAtPoint(snapPos)) return;
 
-        Part a = parts[0], b = parts[1];
+        /* Pick the top two by sorting order. */
+        parts.Sort((p1, p2) =>
+        {
+            int so1 = p1.GetComponent<SpriteRenderer>().sortingOrder;
+            int so2 = p2.GetComponent<SpriteRenderer>().sortingOrder;
+            return so2.CompareTo(so1);
+        });
 
-        // visual sprite
-        GameObject conn = new(type.ToString());
+        Part a = parts[0];
+        Part b = parts[1];
+
+        /* ------------------------------------------------------------------ */
+        GameObject conn = new GameObject(type.ToString());
         conn.transform.position = snapPos;
         conn.transform.SetParent(b.transform, true);
 
         SpriteRenderer sr = conn.AddComponent<SpriteRenderer>();
-        float worldSize = 0f;
+        float visSize = 0f;
 
-        if (type == JointType.Bolt)
+        switch (type)
         {
-            sr.color = boltColor;
-            sr.sprite = boltSprite;
-            sr.sortingOrder = boltSortingOrder;
-            worldSize = boltSize;
-        }
-        else if (type == JointType.Hinge)
-        {
-            sr.color = hingeColor;
-            sr.sprite = hingeSprite;
-            sr.sortingOrder = hingeSortingOrder;
-            worldSize = hingeSize;
-        }
-        else // Motor
-        {
-            sr.color = motorColor;
-            sr.sprite = motorSprite;
-            sr.sortingOrder = motorSortingOrder;
-            worldSize = motorSize;
+            case JointType.Bolt:
+                sr.color = boltColor; sr.sprite = boltSprite; visSize = boltSize; break;
+            case JointType.Hinge:
+                sr.color = hingeColor; sr.sprite = hingeSprite; visSize = hingeSize; break;
+            case JointType.Motor:
+                sr.color = motorColor; sr.sprite = motorSprite; visSize = motorSize; break;
         }
 
-        // keep sprite round even when parent is scaled
+        sr.sortingOrder = Mathf.Max(
+            a.GetComponent<SpriteRenderer>().sortingOrder,
+            b.GetComponent<SpriteRenderer>().sortingOrder) + 1;
+        SortingOrderManager.EnsureAtLeast(sr.sortingOrder);
+
         Vector3 ps = b.transform.lossyScale;
-        conn.transform.localScale = new(worldSize / ps.x, worldSize / ps.y, 1f);
+        conn.transform.localScale = new(visSize / ps.x, visSize / ps.y, 1f);
 
-        // physics joint
         Rigidbody2D rbA = a.GetComponent<Rigidbody2D>();
 
         if (type == JointType.Bolt)
         {
-            var j = b.gameObject.AddComponent<FixedJoint2D>();
-            j.connectedBody = rbA;
-            j.enableCollision = false;
+            FixedJoint2D j = b.gameObject.AddComponent<FixedJoint2D>();
+            j.connectedBody = rbA; j.enableCollision = false;
             j.anchor = conn.transform.localPosition;
         }
         else
         {
-            var j = b.gameObject.AddComponent<HingeJoint2D>();
-            j.connectedBody = rbA;
-            j.enableCollision = false;
+            HingeJoint2D j = b.gameObject.AddComponent<HingeJoint2D>();
+            j.connectedBody = rbA; j.enableCollision = false;
             j.anchor = conn.transform.localPosition;
 
             if (type == JointType.Motor)
             {
                 j.useMotor = true;
                 JointMotor2D m = j.motor;
-                m.maxMotorTorque = Mathf.Infinity;
+
+                const float LEVER_ARM = 0.5f;
+                float defaultTorque = defaultMass * 9.81f * LEVER_ARM * 1.2f;
+
+                m.maxMotorTorque = defaultTorque;
                 m.motorSpeed = motorClockwiseDefault ? -motorDefaultSpeed : motorDefaultSpeed;
                 j.motor = m;
 
-                // clickable sprite and context menu
                 CircleCollider2D cc = conn.AddComponent<CircleCollider2D>();
-                cc.isTrigger = true;
-                cc.radius = 0.5f;
+                cc.isTrigger = true; cc.radius = 0.5f;
 
-                Motor ui = conn.AddComponent<Motor>();
-                ui.Init(j);
+                Motor ui = conn.AddComponent<Motor>(); ui.Init(j);
             }
         }
 
-        // connectivity
+        JointVisual jv = conn.AddComponent<JointVisual>();
+        jv.Init(a.GetComponent<SpriteRenderer>(), b.GetComponent<SpriteRenderer>());
+
         a.AddConnectedPart(b);
         b.AddConnectedPart(a);
     }
@@ -258,18 +402,15 @@ public class Spawner : MonoBehaviour
     private static bool IsConnectionAtPoint(Vector3 wp)
     {
         const float eps2 = 1e-6f;
-        foreach (var j in Object.FindObjectsByType<AnchoredJoint2D>(FindObjectsSortMode.None))
-            if ((j.transform.TransformPoint(j.anchor) - wp).sqrMagnitude < eps2) return true;
+        foreach (AnchoredJoint2D j in Object.FindObjectsByType<AnchoredJoint2D>(FindObjectsSortMode.None))
+            if ((j.transform.TransformPoint(j.anchor) - wp).sqrMagnitude < eps2)
+                return true;
         return false;
     }
 
-    // UTILITY
-    private void ToggleFreeze()
-    {
-        Time.timeScale = Time.timeScale == 0f ? 1f : 0f;
-        if (freezeIndicator) freezeIndicator.enabled = Frozen;
-    }
-
+    /* =======================================================================
+     *  UTILITY
+     * ===================================================================== */
     private Vector3 GetWorldMouse()
     {
         Vector3 wp = Camera.main.ScreenToWorldPoint(Input.mousePosition);
