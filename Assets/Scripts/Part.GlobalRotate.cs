@@ -1,16 +1,10 @@
 // Part.GlobalRotate.cs – R key shortcut for rotating a selection when *not* dragging
-// CHANGELOG #48 (2025?05?15)
-//   • Restores the ability to rotate connectivity groups while *not* dragging.
-//   • Works for single?part and multi?part selections. The part that was last
-//     clicked (mainSelected) is used as the pivot; if no single mainSelected
-//     exists (e.g. true multi?select), the first part in currentGroup becomes
-//     the implicit leader.
-//   • Rotation occurs only in *design* mode (Time.timeScale == 0) and snaps to
-//     the grid (45° increments). After the turn the whole group is shifted so
-//     the leader finishes exactly on the nearest 0.25?unit grid point.
-//   • Ignores the shortcut whenever a drag operation is active so it does not
-//     conflict with the "rotate?while?dragging" logic already present in
-//     Part.Dragging.cs.
+// CHANGELOG #52 (2025?05?15)
+//   • Bug?fix: rotation shortcut now checks Part.IsInteracting instead of the
+//     per?part dragMode flag.  This prevents a stale non?None dragMode on the
+//     leader part from blocking the shortcut, restoring reliable group
+//     rotation while *not* dragging.
+//   • No other behaviour changed.
 
 using System.Collections.Generic;
 using UnityEngine;
@@ -21,7 +15,7 @@ public partial class Part
     private void HandleGlobalRotationShortcut()
     {
         /* 1. Only run in design mode (frozen) and when *no* drag is underway. */
-        if (!Frozen || dragMode != DragMode.None) return;
+        if (!Frozen || IsInteracting) return;
 
         /* 2. Key test */
         if (!Input.GetKeyDown(KeyCode.R)) return;

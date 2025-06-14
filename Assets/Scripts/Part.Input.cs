@@ -1,5 +1,22 @@
-// Part.Input.cs – per?frame Update & mouse handling
-// CHANGELOG #32 (2025?05?15)
+// Part.Input.cs – per-frame Update & mouse handling
+// CHANGELOG #50 (2025-05-15)
+//   • Selection collapse onto a single part is now **deferred** until the
+//     mouse button is released *and* no drag movement occurred. This allows
+//     multi-part selections to be dragged together without collapsing
+//     immediately on mouse?down. Behaviour when Shift is held or when
+//     clicking unselected parts is unchanged.
+//   • Implementation notes:
+//       – On mouse?down over an already?selected part (without Shift), we now
+//         mark the click as a candidate (leftCandidate = true) **but do not**
+//         collapse the selection.
+//       – BeginDrag() is still invoked immediately so the user can start
+//         moving parts right away.
+//       – In Part.Dragging.cs, the click candidate is cleared automatically
+//         once the cursor moves beyond a tiny threshold, preventing unwanted
+//         collapse after a drag.
+//
+// (Previous changelog #32 retained below for reference.)
+// CHANGELOG #32 (2025-05-15)
 //   • Clicking a part that is already selected *without* Shift now shrinks the
 //     selection to that single part before beginning any drag. This lets you
 //     quickly collapse a multi?selection to one part with a simple click.
@@ -45,7 +62,7 @@ public partial class Part
     private void HandleLeftClick()
     {
         if (!Frozen || choosingNoCollision) return;
-        if (PointerOverAnyMenu()) return; // NEW: block selection through UI menus
+        if (PointerOverAnyMenu()) return; // block selection through UI menus
 
         Vector3 wMouse = GetWorldMouse();
         bool overThis = col.OverlapPoint(wMouse);
@@ -55,17 +72,17 @@ public partial class Part
         /* ---------- press ---------- */
         if (Input.GetMouseButtonDown(0) && topHere)
         {
-            // Second click on an already?selected part – now SINGLE?select it
             if (IsSelected() && !shift)
             {
-                if (currentGroup.Count > 1)
-                    SelectAsSingle();      // collapse to just this part
-
-                BeginDrag();               // immediate drag (unchanged)
+                // Part of an existing multi?selection – prepare for possible
+                // collapse on mouse?up, but keep the current selection alive
+                // so the user can drag multiple parts immediately.
+                leftCandidate = true;      // click candidate (may be cancelled)
+                BeginDrag();               // immediate drag with full selection
             }
             else
             {
-                leftCandidate = true;     // arm for potential selection on release
+                leftCandidate = true;      // arm for potential selection on release
             }
         }
 
